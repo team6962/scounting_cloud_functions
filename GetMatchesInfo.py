@@ -12,11 +12,12 @@ from cloudevents.http import CloudEvent
 # Initialize BigQuery client
 client = bigquery.Client()
 
+
 @functions_framework.cloud_event
 def fetch_and_store_matches(cloud_event: CloudEvent):
     data = base64.b64decode(cloud_event.data["message"]["data"])
     data_json = json.loads(data)
-    
+
     if 'event_key' not in data_json:
         logging.error("Missing 'event_key' in the message")
         return 'Missing event_key', 400
@@ -37,6 +38,12 @@ def fetch_and_store_matches(cloud_event: CloudEvent):
 
     matches = response.json()
 
+    # Create DataFrame from original data for {event_key}_matches table
+    df_original = pd.json_normalize(matches)
+    df_original.columns = df_original.columns.str.replace('.', '_', regex=False)
+    df_original = df_original.astype(str)
+    load_data_to_bigquery(df_original, dataset_id, f"{event_key}_matches", "Original data loaded")
+
     # Process matches to create a flattened DataFrame
     rows = []
     for match in matches:
@@ -47,7 +54,7 @@ def fetch_and_store_matches(cloud_event: CloudEvent):
                 alliance_team_key = f"{alliance_color}{index}"  # e.g., red1, blue2
                 alliance_is_winner = True if alliance_color == winning_alliance else False
                 robot_number = str(index)  # To match with Robot1, Robot2, Robot3
-                
+
                 # Prepare a dictionary to hold score breakdown data with "alliance_" prefix
                 score_breakdown_prefixed = {}
                 for key, value in match['score_breakdown'][alliance_color].items():
@@ -58,7 +65,7 @@ def fetch_and_store_matches(cloud_event: CloudEvent):
                     else:
                         new_key = f"alliance_{key}"
                         score_breakdown_prefixed[new_key] = value
-                
+
                 row = {
                     'team_key': team_key,
                     'alliance': alliance_color,
@@ -73,28 +80,25 @@ def fetch_and_store_matches(cloud_event: CloudEvent):
                     **score_breakdown_prefixed  # Unpack alliance-specific score breakdown with "alliance_" prefix
                 }
                 rows.append(row)
-    
-    df = pd.DataFrame(rows)
 
-    # Replace periods in column names with underscores and convert to string
-    df.columns = df.columns.str.replace('.', '_', regex=False)
-    df = df.astype(str)
+    df_flattened = pd.DataFrame(rows)
+    df_flattened.columns = df_flattened.columns.str.replace('.', '_', regex=False)
+    df_flattened = df_flattened.astype(str)
+    load_data_to_bigquery(df_flattened, dataset_id, f"{event_key}_matches_flattened", "Flattened data loaded")
 
-    table_id = f"{dataset_id}.{event_key}_matches"
-    
-    # Define the job configuration for loading the DataFrame into BigQuery
+    return jsonify({"message": "Successfully loaded data into BigQuery"}), 200
+
+
+def load_data_to_bigquery(df, dataset_id, table_name, success_message):
+    table_id = f"{dataset_id}.{table_name}"
     job_config = bigquery.LoadJobConfig(
         autodetect=True,
-        write_disposition="WRITE_TRUNCATE",  # Overwrites the table if it already exists
+        write_disposition="WRITE_TRUNCATE",
     )
-
-    # Attempt to load the DataFrame into BigQuery
     try:
         load_job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
         load_job.result()  # Wait for the job to complete
-        logging.info(f"Data loaded to table {table_id}")
+        logging.info(f"{success_message} to table {table_id}")
     except Exception as e:
         logging.error(f"Failed to load data to BigQuery: {e}")
-        return jsonify({"error": "Failed to load data into BigQuery", "details": str(e)}), 500
-
-    return jsonify({"message": "Successfully loaded data into BigQuery"}), 200
+        raise e
